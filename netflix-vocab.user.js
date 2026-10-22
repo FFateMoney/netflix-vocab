@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.3
+// @version      0.4
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方显示中文小字
 // @match        https://www.netflix.com/*
+// @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
+// @downloadURL  https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
