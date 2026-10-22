@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.9
+// @version      0.10
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方或词后括号里显示中文
 // @match        https://www.netflix.com/*
 // @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
@@ -469,6 +469,8 @@
     background:rgba(20,20,20,.85);color:#ffd54a;font-size:16px;font-weight:600;border-radius:8px 0 0 8px;
     cursor:pointer;user-select:none;transform:translateX(22px);opacity:.6;transition:transform .2s,opacity .2s}
   .tab:hover,.tab.open{transform:none;opacity:1}
+  .panel,.list{scrollbar-width:none}
+  .panel::-webkit-scrollbar,.list::-webkit-scrollbar{display:none}
   .panel{position:fixed;top:12vh;right:40px;width:320px;max-height:76vh;overflow:auto;padding:12px 14px;
     background:rgba(20,20,20,.94);color:#eee;font-size:13px;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.6)}
   .panel[hidden]{display:none}
