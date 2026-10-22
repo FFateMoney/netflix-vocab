@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.7
+// @version      0.8
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方或词后括号里显示中文
 // @match        https://www.netflix.com/*
 // @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
@@ -570,10 +570,14 @@
 
   function start() {
     loadFreq().then(() => {
-      let timer = null;
-      new MutationObserver(() => {
-        if (timer) return;
-        timer = setTimeout(() => { timer = null; scan(); }, 30);
+      // Netflix 大约每秒会把整句字幕的 DOM 换掉一次。必须在同一个微任务里立刻重新标注，
+      // 不能防抖/延时，否则浏览器会先画出几帧没有标注的字幕，表现为闪烁
+      const inSubtitle = n => n.nodeType === 1 && (n.matches('.player-timedtext') || n.querySelector('.player-timedtext'));
+      new MutationObserver(records => {
+        for (const r of records) {
+          const el = r.target.nodeType === 1 ? r.target : r.target.parentElement;
+          if ((el && el.closest('.player-timedtext')) || [...r.addedNodes].some(inSubtitle)) { scan(); return; }
+        }
       }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
       scan();
     });
