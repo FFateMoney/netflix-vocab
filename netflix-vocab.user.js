@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.4
+// @version      0.5
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方显示中文小字
 // @match        https://www.netflix.com/*
 // @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
@@ -14,7 +14,7 @@
   'use strict';
 
   // ---------- 配置 ----------
-  const KNOWN_TOP_N = 2000;   // 词频前 N 个视为“认识”，越大标注越少
+  const KNOWN_TOP_N = 5000;  // 词频前 N 个视为“认识”，越大标注越少
   const MIN_LEN = 4;          // 太短的词不标
   const TARGET_LANG = 'zh-CN';
   const BATCH_SIZE = 20;      // 每次请求翻译的词数
@@ -227,27 +227,41 @@
   };
 
   // ---------- 渲染：给屏幕上的字幕加注释 ----------
-  function annotate(span) {
+  // 处理过的文本节点不再重复处理（否则注释后剩下的片段会被当成句首重新判断）
+  const done = new WeakSet();
+
+  function annotate(node) {
     const frag = document.createDocumentFragment();
     let changed = false;
-    for (const tok of tokenize(span.textContent)) {
-      if (!tok.word) { frag.appendChild(document.createTextNode(tok.text)); continue; }
+    const addText = text => {
+      const t = document.createTextNode(text);
+      done.add(t);
+      return t;
+    };
+    for (const tok of tokenize(node.nodeValue)) {
+      if (!tok.word) { frag.appendChild(addText(tok.text)); continue; }
       changed = true;
       const ruby = document.createElement('ruby');
-      ruby.appendChild(document.createTextNode(tok.text));
+      ruby.appendChild(addText(tok.text));
       const rt = document.createElement('rt');
       rt.style.cssText = 'font-size:0.5em;color:#ffd54a;font-weight:normal;';
       ruby.appendChild(rt);
       frag.appendChild(ruby);
       need(tok.word).then(zh => { rt.textContent = zh; });
     }
-    if (changed) span.replaceChildren(frag);
+    if (changed) node.replaceWith(frag);
+    else done.add(node);
   }
 
   function scan() {
-    document.querySelectorAll('.player-timedtext span').forEach(span => {
-      // 只处理叶子 span；处理过的已含子元素，不会重复处理
-      if (span.children.length === 0 && span.textContent.trim()) annotate(span);
+    // 直接遍历字幕区域里的文本节点，不依赖 span 的层级结构（多行字幕会有换行节点）
+    document.querySelectorAll('.player-timedtext').forEach(root => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const nodes = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      for (const n of nodes) {
+        if (!done.has(n) && n.nodeValue.trim() && !n.parentElement.closest('ruby')) annotate(n);
+      }
     });
   }
 
