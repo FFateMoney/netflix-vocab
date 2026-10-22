@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.8
+// @version      0.9
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方或词后括号里显示中文
 // @match        https://www.netflix.com/*
 // @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
@@ -65,9 +65,8 @@
     return freqReady;
   }
 
-  function isKnown(w) {
-    if (known.has(w)) return true;
-    // 简单还原词形：复数/过去式/进行时/副词
+  // 简单还原词形：复数/过去式/进行时/副词
+  function baseForms(w) {
     const cands = [];
     if (w.endsWith('ies')) cands.push(w.slice(0, -3) + 'y');
     if (w.endsWith('es')) cands.push(w.slice(0, -2));
@@ -76,7 +75,17 @@
     if (w.endsWith('ing')) cands.push(w.slice(0, -3), w.slice(0, -3) + 'e');
     if (w.endsWith('ly')) cands.push(w.slice(0, -2));
     if (w.endsWith('er')) cands.push(w.slice(0, -2));
-    return cands.some(c => known.has(c));
+    return cands;
+  }
+
+  const isKnown = w => known.has(w) || baseForms(w).some(c => known.has(c));
+  // “我认识的词”同样按词形还原：认识 homicide，homicides 也不再标
+  const isIgnored = w => ignore.has(w) || baseForms(w).some(c => ignore.has(c));
+
+  function saveIgnore() {
+    settings.ignore = [...ignore].join(' ');
+    saved.ignore = settings.ignore;
+    store.set('vv_settings', saved);
   }
 
   // 专有名词判断：一个词在字幕里只以大写形式出现在句中（如 “Tell Skyler”），
@@ -140,7 +149,7 @@
       if (!p.lower) return { text: p.text, word: null };
       const cap = !allCaps && /^[A-Z]/.test(p.text);
       const properNoun = cap && (!p.sentStart || isName(p.lower) || (lone && !(lowerCnt.get(p.lower) > 0)));
-      const skip = p.lower.length < settings.minLen || properNoun || ignore.has(p.lower) ||
+      const skip = p.lower.length < settings.minLen || properNoun || isIgnored(p.lower) ||
         isKnown(p.lower) || (allCaps && isName(p.lower));
       return { text: p.text, word: skip ? null : p.lower };
     });
@@ -250,6 +259,8 @@
   const seenFiles = new Set();
   let cues = [];              // [{begin, text, lone}]
   let planned = new Set();    // 当前阈值下这集所有需要翻译的生词
+  let plannedList = [];       // 同上，带出现时间和次数，按剧情顺序
+  let plannedVersion = 0;     // 每次重新计算加一，面板据此决定要不要重绘列表
 
   function cueText(p) {
     let s = '';
@@ -269,16 +280,40 @@
     const now = video ? video.currentTime : 0;
     const sorted = cues.slice().sort((a, b) => (a.begin >= now ? 0 : 1) - (b.begin >= now ? 0 : 1) || a.begin - b.begin);
     const ordered = [];
-    const seen = new Set();
+    const info = new Map();     // 词 -> {word, begin（首次出现的时间）, n（出现次数）}
     for (const c of sorted) {
       for (const t of tokenize(c.text, c.lone)) {
-        if (t.word && !seen.has(t.word)) { seen.add(t.word); ordered.push(t.word); }
+        if (!t.word) continue;
+        const it = info.get(t.word);
+        if (it) { it.n++; it.begin = Math.min(it.begin, c.begin); }
+        else { info.set(t.word, { word: t.word, begin: c.begin, n: 1 }); ordered.push(t.word); }
       }
     }
-    planned = seen;
+    planned = new Set(ordered);
+    plannedList = [...info.values()].sort((a, b) => a.begin - b.begin);   // 面板里按剧情顺序展示
+    plannedVersion++;
     total = 0;
     enqueue(ordered);
     return ordered.length;
+  }
+
+  // 面板里“认识 / 不认识”的操作：改完立刻重新计算本集生词并刷新屏幕上的字幕
+  function afterIgnoreChange() {
+    saveIgnore();
+    if (cues.length) planWords();
+    rerender();
+  }
+  function addIgnore(word) {
+    word = String(word).toLowerCase().trim();
+    if (!/^[a-z][a-z'’-]*$/.test(word) || ignore.has(word)) return false;
+    ignore.add(word);
+    afterIgnoreChange();
+    return true;
+  }
+  function removeIgnore(word) {
+    if (!ignore.delete(word)) return false;
+    afterIgnoreChange();
+    return true;
   }
 
   async function handleSubtitle(xml) {
@@ -434,7 +469,7 @@
     background:rgba(20,20,20,.85);color:#ffd54a;font-size:16px;font-weight:600;border-radius:8px 0 0 8px;
     cursor:pointer;user-select:none;transform:translateX(22px);opacity:.6;transition:transform .2s,opacity .2s}
   .tab:hover,.tab.open{transform:none;opacity:1}
-  .panel{position:fixed;top:12vh;right:40px;width:280px;max-height:76vh;overflow:auto;padding:12px 14px;
+  .panel{position:fixed;top:12vh;right:40px;width:320px;max-height:76vh;overflow:auto;padding:12px 14px;
     background:rgba(20,20,20,.94);color:#eee;font-size:13px;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.6)}
   .panel[hidden]{display:none}
   .hd{display:flex;justify-content:space-between;align-items:center;font-weight:600;font-size:14px;margin-bottom:8px;color:#ffd54a}
@@ -451,20 +486,51 @@
   .btns{display:flex;gap:8px;margin-top:10px}
   .st{margin-top:8px;font-size:12px;color:#aaa;line-height:1.5}
   input[type=color]{width:40px;height:24px;border:none;padding:0;background:none}
+  .tabs{display:flex;gap:4px;margin-bottom:6px}
+  .tabs button{flex:1;padding:5px 2px;font-size:12px}
+  .tabs button.on{background:#ffd54a;color:#111;border-color:#ffd54a}
+  [hidden]{display:none!important}
+  input[type=text]{width:100%;padding:5px 6px;background:#333;color:#eee;border:1px solid #555;border-radius:4px;font-size:12px}
+  .hint{margin:6px 0;font-size:12px;color:#aaa;line-height:1.5}
+  .list{max-height:46vh;overflow:auto;margin-top:6px;border-top:1px solid #333}
+  .item{display:flex;align-items:center;gap:8px;padding:4px 2px;border-bottom:1px solid #2a2a2a}
+  .item .w{flex:0 0 38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+  .item .zh{flex:1;color:#ffd54a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .item .n{color:#888;font-size:11px}
+  .item .rm{padding:1px 7px;font-size:14px;line-height:1.2}
+  .empty{padding:14px 0;text-align:center;color:#888}
 </style>
 <div class="tab" title="生词注释设置">译</div>
 <div class="panel" hidden>
   <div class="hd"><span>生词注释</span><button class="x" id="close">×</button></div>
-  <label class="row"><span>启用</span><input type="checkbox" id="enabled"></label>
-  <div class="row"><span>显示方式</span>
-    <select id="mode"><option value="1">1 上方小字</option><option value="2">2 词后括号</option></select></div>
-  <div class="row"><span>认识的词频 <b id="topN-v"></b></span><input type="range" id="topN" min="500" max="10000" step="500"></div>
-  <div class="row"><span>最短词长 <b id="minLen-v"></b></span><input type="range" id="minLen" min="3" max="8" step="1"></div>
-  <div class="row"><span>注释大小 <b id="size-v"></b>%</span><input type="range" id="size" min="30" max="100" step="5"></div>
-  <div class="row"><span>注释颜色</span><input type="color" id="color"></div>
-  <div class="col"><span>我认识的词（空格或逗号分隔）</span><textarea id="ignore" rows="3"></textarea></div>
-  <div class="st" id="status"></div>
-  <div class="btns"><button id="clearCache">清空翻译缓存</button><button id="reset">恢复默认</button></div>
+  <div class="tabs">
+    <button data-tab="settings" class="on">设置</button>
+    <button data-tab="episode">本集生词 <span id="cnt-ep"></span></button>
+    <button data-tab="known">我认识的词 <span id="cnt-known"></span></button>
+  </div>
+  <div id="pane-settings">
+    <label class="row"><span>启用</span><input type="checkbox" id="enabled"></label>
+    <div class="row"><span>显示方式</span>
+      <select id="mode"><option value="1">1 上方小字</option><option value="2">2 词后括号</option></select></div>
+    <div class="row"><span>认识的词频 <b id="topN-v"></b></span><input type="range" id="topN" min="500" max="10000" step="500"></div>
+    <div class="row"><span>最短词长 <b id="minLen-v"></b></span><input type="range" id="minLen" min="3" max="8" step="1"></div>
+    <div class="row"><span>注释大小 <b id="size-v"></b>%</span><input type="range" id="size" min="30" max="100" step="5"></div>
+    <div class="row"><span>注释颜色</span><input type="color" id="color"></div>
+    <div class="st" id="status"></div>
+    <div class="btns"><button id="clearCache">清空翻译缓存</button><button id="reset">恢复默认</button></div>
+    <div class="hint">“恢复默认”只重置上面的显示设置，不会清掉“我认识的词”。</div>
+  </div>
+  <div id="pane-episode" hidden>
+    <input type="text" id="filter-ep" placeholder="筛选单词">
+    <div class="hint">按剧情顺序。点 × 表示“我认识”，以后任何一集都不再标注。</div>
+    <div class="list" id="list-ep"></div>
+  </div>
+  <div id="pane-known" hidden>
+    <input type="text" id="add-word" placeholder="输入单词，回车添加为“我认识”">
+    <input type="text" id="filter-known" placeholder="筛选" style="margin-top:6px">
+    <div class="hint">点 × 把词移出，之后遇到又会重新标注。</div>
+    <div class="list" id="list-known"></div>
+  </div>
 </div>`;
 
   function buildUI() {
@@ -494,16 +560,127 @@
       $('mode').value = String(settings.mode);
       ['topN', 'minLen', 'size'].forEach(k => { $(k).value = settings[k]; $(k + '-v').textContent = settings[k]; });
       $('color').value = settings.color;
-      $('ignore').value = settings.ignore;
       refreshStatus();
     }
+
+    // ---- 两个词表页 ----
+    let tabName = 'settings';
+    let drawnVersion = -1;      // 本集生词列表对应的 plannedVersion
+    let drawnKnown = '';        // “我认识的词”列表对应的内容，变了才重绘
+    const zhCells = new Map();  // 词 -> 译文所在的元素（翻译到了就原地更新，不重绘列表）
+
+    function makeRow(word, zhText, count, onRemove, title) {
+      const row = document.createElement('div');
+      row.className = 'item';
+      const w = document.createElement('span');
+      w.className = 'w';
+      w.textContent = word;
+      row.appendChild(w);
+      if (zhText != null) {
+        const zh = document.createElement('span');
+        zh.className = 'zh';
+        zh.textContent = zhText;
+        row.appendChild(zh);
+        zhCells.set(word, zh);
+      } else {
+        const sp = document.createElement('span');
+        sp.style.flex = '1';
+        row.appendChild(sp);
+      }
+      if (count > 1) {
+        const n = document.createElement('span');
+        n.className = 'n';
+        n.textContent = '×' + count;
+        row.appendChild(n);
+      }
+      const rm = document.createElement('button');
+      rm.className = 'rm';
+      rm.textContent = '×';
+      rm.title = title;
+      rm.addEventListener('click', () => onRemove(word));
+      row.appendChild(rm);
+      return row;
+    }
+
+    function showEmpty(list, text) {
+      const d = document.createElement('div');
+      d.className = 'empty';
+      d.textContent = text;
+      list.replaceChildren(d);
+    }
+
+    function drawEpisode() {
+      const q = $('filter-ep').value.trim().toLowerCase();
+      const list = $('list-ep');
+      zhCells.clear();
+      const items = plannedList.filter(it => !q || it.word.includes(q));
+      const top = list.scrollTop;   // 连续删词时保持滚动位置
+      if (!items.length) { showEmpty(list, cues.length ? '没有生词了' : '还没有截获到字幕（请刷新播放页）'); }
+      else {
+        const frag = document.createDocumentFragment();
+        items.forEach(it => frag.appendChild(makeRow(it.word, cache.has(it.word) ? cache.get(it.word) : '…', it.n, markKnown, '我认识，以后不再标注')));
+        list.replaceChildren(frag);
+        list.scrollTop = top;
+      }
+      drawnVersion = plannedVersion;
+      $('cnt-ep').textContent = '(' + plannedList.length + ')';
+    }
+
+    function drawKnown() {
+      const q = $('filter-known').value.trim().toLowerCase();
+      const list = $('list-known');
+      const words = [...ignore].filter(w => !q || w.includes(q)).sort();
+      const top = list.scrollTop;
+      if (!words.length) showEmpty(list, ignore.size ? '没有匹配的词' : '还没有“我认识的词”');
+      else {
+        const frag = document.createDocumentFragment();
+        words.forEach(w => frag.appendChild(makeRow(w, null, 0, unmarkKnown, '移出，之后重新标注')));
+        list.replaceChildren(frag);
+        list.scrollTop = top;
+      }
+      drawnKnown = [...ignore].join(' ');
+      $('cnt-known').textContent = '(' + ignore.size + ')';
+    }
+
+    // 列表只在内容变了才重绘；译文翻译到了就原地更新，不打断滚动和点击
+    function refreshLists() {
+      $('cnt-ep').textContent = '(' + plannedList.length + ')';
+      $('cnt-known').textContent = '(' + ignore.size + ')';
+      if (tabName === 'episode') {
+        if (drawnVersion !== plannedVersion) drawEpisode();
+        zhCells.forEach((el, w) => { if (el.textContent === '…' && cache.has(w)) el.textContent = cache.get(w); });
+      } else if (tabName === 'known' && drawnKnown !== [...ignore].join(' ')) {
+        drawKnown();
+      }
+    }
+
+    function switchTab(name) {
+      tabName = name;
+      root.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+      ['settings', 'episode', 'known'].forEach(n => { $('pane-' + n).hidden = n !== name; });
+      drawnVersion = -1;
+      drawnKnown = '';
+      if (name === 'settings') fillForm();
+      refreshLists();
+    }
+
+    // 改完词表立刻刷新列表，不等定时刷新
+    const markKnown = word => { addIgnore(word); refreshLists(); };
+    const unmarkKnown = word => { removeIgnore(word); refreshLists(); };
+
+    root.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+    $('filter-ep').addEventListener('input', () => { drawnVersion = -1; refreshLists(); });
+    $('filter-known').addEventListener('input', () => { drawnKnown = ''; refreshLists(); });
+    $('add-word').addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      if (addIgnore(e.target.value)) { e.target.value = ''; refreshLists(); }
+    });
 
     let timer = null;
     // 改变会影响“哪些词算生词”的设置：稍等一下再重新计算，避免拖动滑块时频繁重算
     function recompute(delay) {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        parseIgnore();
         rebuildKnown();
         if (cues.length) planWords();
         rerender();
@@ -516,7 +693,7 @@
       saved[key] = value;
       store.set('vv_settings', saved);
       if (key === 'size' || key === 'color') { applyStyle(); return; }
-      recompute(key === 'topN' || key === 'minLen' || key === 'ignore' ? 300 : 0);
+      recompute(key === 'topN' || key === 'minLen' ? 300 : 0);
     }
 
     $('enabled').addEventListener('change', e => {
@@ -529,7 +706,6 @@
       change(k, Number(e.target.value));
     }));
     $('color').addEventListener('input', e => change('color', e.target.value));
-    $('ignore').addEventListener('input', e => change('ignore', e.target.value));
     $('clearCache').addEventListener('click', () => {
       cache.clear();
       failed.clear();
@@ -540,9 +716,10 @@
       refreshStatus();
     });
     $('reset').addEventListener('click', () => {
-      Object.keys(saved).forEach(k => delete saved[k]);
+      // 只重置显示设置，“我认识的词”保留
+      Object.keys(saved).forEach(k => { if (k !== 'ignore') delete saved[k]; });
       store.set('vv_settings', saved);
-      Object.assign(settings, DEFAULTS);
+      Object.assign(settings, DEFAULTS, { ignore: settings.ignore });
       applyStyle();
       fillForm();
       recompute(0);
@@ -551,7 +728,7 @@
     function toggle(open) {
       panel.hidden = !open;
       tab.classList.toggle('open', open);
-      if (open) fillForm();
+      if (open) switchTab(tabName);
     }
     tab.addEventListener('click', () => toggle(panel.hidden));
     $('close').addEventListener('click', () => toggle(false));
@@ -561,7 +738,7 @@
       host.style.display = location.pathname.startsWith('/watch') ? '' : 'none';
       const parent = document.fullscreenElement || document.documentElement;
       if (host.parentNode !== parent) parent.appendChild(host);
-      if (!panel.hidden) refreshStatus();
+      if (!panel.hidden) { refreshStatus(); refreshLists(); }
     }
     document.addEventListener('fullscreenchange', place);
     setInterval(place, 1000);
