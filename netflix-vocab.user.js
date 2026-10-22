@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.5
-// @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方显示中文小字
+// @version      0.6
+// @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方或词后括号里显示中文
 // @match        https://www.netflix.com/*
 // @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
 // @downloadURL  https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
@@ -13,8 +13,10 @@
 (function () {
   'use strict';
 
-  // ---------- 配置 ----------
-  const KNOWN_TOP_N = 5000;  // 词频前 N 个视为“认识”，越大标注越少
+  // ---------- 默认配置 ----------
+  // 播放页右侧的设置面板里改过的项会覆盖这里的值；面板里点“恢复默认”后回到这里的值
+  const MODE = 1;             // 1 = 词上方小字；2 = 词后括号
+  const KNOWN_TOP_N = 5000;   // 词频前 N 个视为“认识”，越大标注越少
   const MIN_LEN = 4;          // 太短的词不标
   const TARGET_LANG = 'zh-CN';
   const BATCH_SIZE = 20;      // 每次请求翻译的词数
@@ -22,30 +24,42 @@
   const FREQ_URL = 'https://raw.githubusercontent.com/first20hours/google-10000-english/master/google-10000-english-no-swears.txt';
   // --------------------------
 
-  const known = new Set();
+  const DEFAULTS = { enabled: true, mode: MODE, topN: KNOWN_TOP_N, minLen: MIN_LEN, size: 55, color: '#ffd54a', ignore: '' };
+
+  const store = {
+    get(key, fallback) {
+      try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? fallback : v; } catch (e) { return fallback; }
+    },
+    set(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* 存储已满或被禁用 */ }
+    },
+  };
+
+  const saved = store.get('vv_settings', {});          // 只记录在面板里改过的项
+  const settings = Object.assign({}, DEFAULTS, saved);
+  let ignore = new Set();
+  function parseIgnore() {
+    ignore = new Set(String(settings.ignore).toLowerCase().split(/[\s,，;；]+/).filter(Boolean));
+  }
+  parseIgnore();
+
+  // ---------- 词频与专有名词 ----------
+  let freqList = [];
+  let freqLoaded = false;
   let freqReady = null;       // Promise，词频表加载完成
-  const cache = new Map();
-  const inflight = new Set();
-  const queue = [];
-  let running = 0;
-  let backoffUntil = 0;
-  let saveTimer = null;
+  const known = new Set();
 
-  try {
-    Object.entries(JSON.parse(localStorage.getItem('vv_cache')) || {}).forEach(([k, v]) => cache.set(k, v));
-  } catch (e) { /* 缓存损坏就忽略 */ }
-
-  function saveCache() {
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      try { localStorage.setItem('vv_cache', JSON.stringify(Object.fromEntries(cache))); } catch (e) { /* 存储已满 */ }
-    }, 2000);
+  function rebuildKnown() {
+    known.clear();
+    freqList.slice(0, settings.topN).forEach(w => known.add(w));
   }
 
   function loadFreq() {
     if (!freqReady) {
       freqReady = fetch(FREQ_URL).then(r => r.text()).then(txt => {
-        txt.split('\n').slice(0, KNOWN_TOP_N).forEach(w => known.add(w.trim().toLowerCase()));
+        freqList = txt.split('\n').map(w => w.trim().toLowerCase()).filter(Boolean);
+        rebuildKnown();
+        freqLoaded = true;
       });
     }
     return freqReady;
@@ -65,25 +79,91 @@
     return cands.some(c => known.has(c));
   }
 
-  // 把一段文字切成 [{text, word}]；word 为需要标注的小写词，否则为 null
-  function tokenize(text) {
+  // 专有名词判断：一个词在字幕里只以大写形式出现在句中（如 “Tell Skyler”），
+  // 而从没以小写出现过，就认为是人名/地名。跨集记住，下次遇到单独一个名字也能认出
+  const capMid = new Map();   // 词 -> 句中大写出现次数
+  const lowerCnt = new Map(); // 词 -> 小写出现次数
+  const names = new Set(store.get('vv_names', []));
+
+  function isName(w) {
+    if (lowerCnt.get(w) > 0) return false;
+    return capMid.get(w) > 0 || names.has(w);
+  }
+
+  const WORD_SPLIT = /([A-Za-z][A-Za-z'’]*)/;
+  const WORDS_G = /[A-Za-z][A-Za-z'’]*/g;
+  const ABBR = new Set(['mr', 'mrs', 'ms', 'dr', 'st', 'jr', 'sr', 'prof', 'vs']);
+
+  // 切成片段：单词带 lower 和 sentStart（是否句首）；其余是标点/空格
+  function splitText(text) {
     const out = [];
-    let first = true;
-    for (const part of text.split(/([A-Za-z][A-Za-z'’]*)/)) {
+    let sentStart = true;
+    let prev = '';
+    for (const part of text.split(WORD_SPLIT)) {
       if (!part) continue;
-      if (!/^[A-Za-z]/.test(part)) { out.push({ text: part, word: null }); continue; }
+      if (!/^[A-Za-z]/.test(part)) {
+        out.push({ text: part });
+        // “Mr.” 之后的句点不算句末
+        if (/[.!?…]/.test(part) && !(ABBR.has(prev) && /^\./.test(part))) sentStart = true;
+        continue;
+      }
       const lower = part.toLowerCase().split(/['’]/)[0];
-      const isCap = /^[A-Z]/.test(part);
-      const skip = lower.length < MIN_LEN || (isCap && !first) || isKnown(lower);
-      first = false;
-      out.push({ text: part, word: skip ? null : lower });
+      out.push({ text: part, lower, sentStart });
+      sentStart = false;
+      prev = lower;
     }
     return out;
   }
 
+  function collectCaps(text) {
+    if (!/[a-z]/.test(text)) return;   // 全大写的行没法判断
+    for (const p of splitText(text)) {
+      if (!p.lower) continue;
+      if (/^[A-Z]/.test(p.text)) {
+        if (!p.sentStart) capMid.set(p.lower, (capMid.get(p.lower) || 0) + 1);
+      } else {
+        lowerCnt.set(p.lower, (lowerCnt.get(p.lower) || 0) + 1);
+      }
+    }
+  }
+
+  function saveNames() {
+    capMid.forEach((n, w) => { if (w.length >= 3 && !lowerCnt.has(w)) names.add(w); });
+    store.set('vv_names', [...names].slice(-10000));
+  }
+
+  // 把一段文字切成 [{text, word}]；word 为需要标注的小写词，否则为 null
+  // lone：这条字幕只有一个词（常是单独喊一个人名）
+  function tokenize(text, lone) {
+    const allCaps = !/[a-z]/.test(text);
+    return splitText(text).map(p => {
+      if (!p.lower) return { text: p.text, word: null };
+      const cap = !allCaps && /^[A-Z]/.test(p.text);
+      const properNoun = cap && (!p.sentStart || isName(p.lower) || (lone && !(lowerCnt.get(p.lower) > 0)));
+      const skip = p.lower.length < settings.minLen || properNoun || ignore.has(p.lower) ||
+        isKnown(p.lower) || (allCaps && isName(p.lower));
+      return { text: p.text, word: skip ? null : p.lower };
+    });
+  }
+
   // ---------- 翻译：批量 + 队列 ----------
+  const cache = new Map(Object.entries(store.get('vv_cache', {})));
+  const inflight = new Set();
+  const failed = new Set();
+  const tries = new Map();
+  const queue = [];
+  let running = 0;
+  let backoffUntil = 0;
+  let saveTimer = null;
+  let total = 0;      // 本轮预加载需要翻译的词数
+
+  function saveCache() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => store.set('vv_cache', Object.fromEntries(cache)), 2000);
+  }
+
   function parseBatch(t) {
-    // 每行一个词，返回 [[译文, 原文, ...], ...]，按原文对应
+    // 每行一个词，返回 {原文: 译文}
     const map = {};
     for (const seg of JSON.parse(t)[0] || []) {
       if (seg && seg[0] && seg[1]) map[seg[1].trim().toLowerCase()] = seg[0].trim();
@@ -97,7 +177,7 @@
     const res = await fetch(url);
     if (res.status === 429) { backoffUntil = Date.now() + 30000; throw new Error('rate limited'); }
     const map = parseBatch(await res.text());
-    words.forEach(w => { if (map[w]) cache.set(w, map[w]); });
+    words.forEach(w => { if (map[w]) cache.set(w, map[w]); else failed.add(w); });
     saveCache();
   }
 
@@ -107,9 +187,17 @@
       const batch = queue.splice(0, BATCH_SIZE);
       running++;
       translateBatch(batch)
-        .catch(() => { queue.push(...batch.filter(w => !cache.has(w))); })
+        .catch(() => {
+          // 失败的词重试，最多 3 次，之后放弃（不再死循环）
+          batch.forEach(w => {
+            if (cache.has(w)) return;
+            const n = (tries.get(w) || 0) + 1;
+            tries.set(w, n);
+            if (n < 3) queue.push(w); else failed.add(w);
+          });
+        })
         .finally(() => {
-          batch.forEach(w => inflight.delete(w));
+          batch.forEach(w => { if (!queue.includes(w)) inflight.delete(w); });
           running--;
           waiting.forEach(fn => fn());
           if (!queue.length && running === 0 && total > 0) reportDone();
@@ -124,6 +212,7 @@
     return new Promise(resolve => {
       const check = () => {
         if (cache.has(word)) { waiting.delete(check); resolve(cache.get(word)); }
+        else if (failed.has(word)) { waiting.delete(check); resolve(''); }
         else if (!inflight.has(word) && !queue.includes(word)) { queue.unshift(word); inflight.add(word); pump(); }
       };
       waiting.add(check);
@@ -131,10 +220,9 @@
     });
   }
 
-  let total = 0;      // 本轮预加载需要翻译的词数
   function enqueue(words) {
     for (const w of words) {
-      if (cache.has(w) || inflight.has(w)) continue;
+      if (cache.has(w) || inflight.has(w) || failed.has(w)) continue;
       inflight.add(w);
       queue.push(w);
       total++;
@@ -160,6 +248,8 @@
 
   // ---------- 截获字幕文件并预翻译 ----------
   const seenFiles = new Set();
+  let cues = [];              // [{begin, text, lone}]
+  let planned = new Set();    // 当前阈值下这集所有需要翻译的生词
 
   function cueText(p) {
     let s = '';
@@ -173,38 +263,54 @@
     return s;
   }
 
+  // 按当前设置重新计算这集的生词并排队翻译；从当前播放位置开始往后翻，其余排在后面
+  function planWords() {
+    const video = document.querySelector('video');
+    const now = video ? video.currentTime : 0;
+    const sorted = cues.slice().sort((a, b) => (a.begin >= now ? 0 : 1) - (b.begin >= now ? 0 : 1) || a.begin - b.begin);
+    const ordered = [];
+    const seen = new Set();
+    for (const c of sorted) {
+      for (const t of tokenize(c.text, c.lone)) {
+        if (t.word && !seen.has(t.word)) { seen.add(t.word); ordered.push(t.word); }
+      }
+    }
+    planned = seen;
+    total = 0;
+    enqueue(ordered);
+    return ordered.length;
+  }
+
   async function handleSubtitle(xml) {
-    if (seenFiles.has(xml.length + xml.slice(0, 200))) return;
+    const sig = xml.length + xml.slice(0, 200);
+    if (seenFiles.has(sig)) return;
     const doc = new DOMParser().parseFromString(xml, 'application/xml');
     const root = doc.documentElement;
     if (!root || root.nodeName.toLowerCase() !== 'tt') return;
     if (!/^en/i.test(root.getAttribute('xml:lang') || '')) return;
-    seenFiles.add(xml.length + xml.slice(0, 200));
+    seenFiles.add(sig);
 
     await loadFreq();
     const tick = Number(root.getAttribute('ttp:tickRate')) || 10000000;
-    const cues = [];
+    const list = [];
     for (const p of doc.getElementsByTagName('p')) {
       const m = /^(\d+)t$/.exec(p.getAttribute('begin') || '');
-      const begin = m ? Number(m[1]) / tick : 0;
-      const words = tokenize(cueText(p)).map(t => t.word).filter(Boolean);
-      if (words.length) cues.push({ begin, words });
+      const text = cueText(p);
+      const lone = (text.match(WORDS_G) || []).length === 1;
+      list.push({ begin: m ? Number(m[1]) / tick : 0, text, lone });
     }
-    // 从当前播放位置开始往后翻译，其余排在后面
-    const video = document.querySelector('video');
-    const now = video ? video.currentTime : 0;
-    cues.sort((a, b) => (a.begin >= now ? 0 : 1) - (b.begin >= now ? 0 : 1) || a.begin - b.begin);
-    const ordered = [];
-    const seen = new Set();
-    cues.forEach(c => c.words.forEach(w => { if (!seen.has(w)) { seen.add(w); ordered.push(w); } }));
-    enqueue(ordered);
-    console.log('[netflix-vocab] 字幕 ' + cues.length + ' 句，待翻译生词 ' + ordered.length + ' 个');
+    // 先统计整集里哪些词是专有名词，再挑生词
+    list.forEach(c => collectCaps(c.text));
+    saveNames();
+    cues = list;
+    const n = planWords();
+    console.log('[netflix-vocab] 字幕 ' + cues.length + ' 句，待翻译生词 ' + n + ' 个');
+    rerender();
   }
 
   // 钩住 XHR / fetch，按内容识别 TTML 字幕
   const looksLikeTTML = t => typeof t === 'string' && /^\s*(<\?xml|<tt[\s>])/.test(t.slice(0, 200));
 
-  const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function () {
     this.addEventListener('load', () => {
@@ -227,10 +333,23 @@
   };
 
   // ---------- 渲染：给屏幕上的字幕加注释 ----------
-  // 处理过的文本节点不再重复处理（否则注释后剩下的片段会被当成句首重新判断）
-  const done = new WeakSet();
+  const style = document.createElement('style');
+  style.textContent =
+    '.vv-note{color:var(--vv-color);font-weight:normal}' +
+    'rt.vv-note{font-size:calc(var(--vv-size) * 1em)}' +
+    'span.vv-note{font-size:calc(var(--vv-size) * 1.25em);margin-left:.1em}';
+  document.documentElement.appendChild(style);
 
-  function annotate(node) {
+  function applyStyle() {
+    document.documentElement.style.setProperty('--vv-size', String(settings.size / 100));
+    document.documentElement.style.setProperty('--vv-color', settings.color);
+  }
+  applyStyle();
+
+  // 处理过的文本节点不再重复处理（否则注释后剩下的片段会被当成句首重新判断）
+  let done = new WeakSet();
+
+  function annotate(node, lone) {
     const frag = document.createDocumentFragment();
     let changed = false;
     const addText = text => {
@@ -238,38 +357,200 @@
       done.add(t);
       return t;
     };
-    for (const tok of tokenize(node.nodeValue)) {
+    const paren = settings.mode === 2;
+    for (const tok of tokenize(node.nodeValue, lone)) {
       if (!tok.word) { frag.appendChild(addText(tok.text)); continue; }
       changed = true;
-      const ruby = document.createElement('ruby');
-      ruby.appendChild(addText(tok.text));
-      const rt = document.createElement('rt');
-      rt.style.cssText = 'font-size:0.5em;color:#ffd54a;font-weight:normal;';
-      ruby.appendChild(rt);
-      frag.appendChild(ruby);
-      need(tok.word).then(zh => { rt.textContent = zh; });
+      const wrap = document.createElement(paren ? 'span' : 'ruby');
+      wrap.className = 'vv-wrap';
+      wrap.appendChild(addText(tok.text));
+      const note = document.createElement(paren ? 'span' : 'rt');
+      note.className = 'vv-note';
+      wrap.appendChild(note);
+      frag.appendChild(wrap);
+      need(tok.word).then(zh => { if (zh) note.textContent = paren ? '(' + zh + ')' : zh; });
     }
     if (changed) node.replaceWith(frag);
     else done.add(node);
   }
 
   function scan() {
+    if (!settings.enabled || !freqLoaded) return;
     // 直接遍历字幕区域里的文本节点，不依赖 span 的层级结构（多行字幕会有换行节点）
     document.querySelectorAll('.player-timedtext').forEach(root => {
+      const lone = (root.textContent.match(WORDS_G) || []).length === 1;
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       const nodes = [];
       while (walker.nextNode()) nodes.push(walker.currentNode);
       for (const n of nodes) {
-        if (!done.has(n) && n.nodeValue.trim() && !n.parentElement.closest('ruby')) annotate(n);
+        if (!done.has(n) && n.nodeValue.trim() && !n.parentElement.closest('.vv-wrap')) annotate(n, lone);
       }
     });
   }
 
+  function clearAnnotations() {
+    document.querySelectorAll('.vv-wrap').forEach(w => w.replaceWith(document.createTextNode(w.firstChild.nodeValue)));
+    done = new WeakSet();
+  }
+
+  function rerender() {
+    clearAnnotations();
+    scan();
+  }
+
+  // ---------- 设置面板：收在右侧边缘，鼠标移上去滑出，点击展开 ----------
+  const PANEL_HTML = `
+<style>
+  :host{all:initial}
+  *{box-sizing:border-box;font-family:-apple-system,"Segoe UI","PingFang SC",sans-serif}
+  .tab{position:fixed;top:38%;right:0;width:30px;height:52px;display:flex;align-items:center;justify-content:center;
+    background:rgba(20,20,20,.85);color:#ffd54a;font-size:16px;font-weight:600;border-radius:8px 0 0 8px;
+    cursor:pointer;user-select:none;transform:translateX(22px);opacity:.6;transition:transform .2s,opacity .2s}
+  .tab:hover,.tab.open{transform:none;opacity:1}
+  .panel{position:fixed;top:12vh;right:40px;width:280px;max-height:76vh;overflow:auto;padding:12px 14px;
+    background:rgba(20,20,20,.94);color:#eee;font-size:13px;border-radius:10px;box-shadow:0 4px 24px rgba(0,0,0,.6)}
+  .panel[hidden]{display:none}
+  .hd{display:flex;justify-content:space-between;align-items:center;font-weight:600;font-size:14px;margin-bottom:8px;color:#ffd54a}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:8px 0}
+  .col{margin:8px 0}
+  .col span{display:block;margin-bottom:4px}
+  input[type=range]{width:130px;accent-color:#ffd54a}
+  select,textarea,button{background:#333;color:#eee;border:1px solid #555;border-radius:4px;font-size:12px}
+  select{padding:3px}
+  textarea{width:100%;padding:4px;resize:vertical}
+  button{padding:4px 8px;cursor:pointer}
+  button:hover{background:#444}
+  .x{border:none;background:none;font-size:16px;color:#aaa}
+  .btns{display:flex;gap:8px;margin-top:10px}
+  .st{margin-top:8px;font-size:12px;color:#aaa;line-height:1.5}
+  input[type=color]{width:40px;height:24px;border:none;padding:0;background:none}
+</style>
+<div class="tab" title="生词注释设置">译</div>
+<div class="panel" hidden>
+  <div class="hd"><span>生词注释</span><button class="x" id="close">×</button></div>
+  <label class="row"><span>启用</span><input type="checkbox" id="enabled"></label>
+  <div class="row"><span>显示方式</span>
+    <select id="mode"><option value="1">1 上方小字</option><option value="2">2 词后括号</option></select></div>
+  <div class="row"><span>认识的词频 <b id="topN-v"></b></span><input type="range" id="topN" min="500" max="10000" step="500"></div>
+  <div class="row"><span>最短词长 <b id="minLen-v"></b></span><input type="range" id="minLen" min="3" max="8" step="1"></div>
+  <div class="row"><span>注释大小 <b id="size-v"></b>%</span><input type="range" id="size" min="30" max="100" step="5"></div>
+  <div class="row"><span>注释颜色</span><input type="color" id="color"></div>
+  <div class="col"><span>我认识的词（空格或逗号分隔）</span><textarea id="ignore" rows="3"></textarea></div>
+  <div class="st" id="status"></div>
+  <div class="btns"><button id="clearCache">清空翻译缓存</button><button id="reset">恢复默认</button></div>
+</div>`;
+
+  function buildUI() {
+    const host = document.createElement('div');
+    host.id = 'vv-ui';
+    host.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;';
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = PANEL_HTML;
+    const $ = id => root.getElementById(id);
+    const tab = root.querySelector('.tab');
+    const panel = root.querySelector('.panel');
+
+    // 不让点击/键盘/滚轮穿到 Netflix 播放器上（避免暂停、快捷键、音量被触发）
+    ['click', 'dblclick', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'wheel', 'contextmenu', 'keydown', 'keyup', 'keypress']
+      .forEach(ev => host.addEventListener(ev, e => e.stopPropagation()));
+
+    function refreshStatus() {
+      let n = 0;
+      planned.forEach(w => { if (cache.has(w)) n++; });
+      $('status').textContent = cues.length
+        ? '字幕 ' + cues.length + ' 句 · 生词 ' + planned.size + ' 个 · 已翻译 ' + n + '（缓存共 ' + cache.size + '）'
+        : '还没有截获到字幕（请刷新播放页）';
+    }
+
+    function fillForm() {
+      $('enabled').checked = settings.enabled;
+      $('mode').value = String(settings.mode);
+      ['topN', 'minLen', 'size'].forEach(k => { $(k).value = settings[k]; $(k + '-v').textContent = settings[k]; });
+      $('color').value = settings.color;
+      $('ignore').value = settings.ignore;
+      refreshStatus();
+    }
+
+    let timer = null;
+    // 改变会影响“哪些词算生词”的设置：稍等一下再重新计算，避免拖动滑块时频繁重算
+    function recompute(delay) {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        parseIgnore();
+        rebuildKnown();
+        if (cues.length) planWords();
+        rerender();
+        refreshStatus();
+      }, delay);
+    }
+
+    function change(key, value) {
+      settings[key] = value;
+      saved[key] = value;
+      store.set('vv_settings', saved);
+      if (key === 'size' || key === 'color') { applyStyle(); return; }
+      recompute(key === 'topN' || key === 'minLen' || key === 'ignore' ? 300 : 0);
+    }
+
+    $('enabled').addEventListener('change', e => {
+      change('enabled', e.target.checked);
+      if (!e.target.checked) clearAnnotations();
+    });
+    $('mode').addEventListener('change', e => change('mode', Number(e.target.value)));
+    ['topN', 'minLen', 'size'].forEach(k => $(k).addEventListener('input', e => {
+      $(k + '-v').textContent = e.target.value;
+      change(k, Number(e.target.value));
+    }));
+    $('color').addEventListener('input', e => change('color', e.target.value));
+    $('ignore').addEventListener('input', e => change('ignore', e.target.value));
+    $('clearCache').addEventListener('click', () => {
+      cache.clear();
+      failed.clear();
+      tries.clear();
+      store.set('vv_cache', {});
+      if (cues.length) planWords();
+      rerender();
+      refreshStatus();
+    });
+    $('reset').addEventListener('click', () => {
+      Object.keys(saved).forEach(k => delete saved[k]);
+      store.set('vv_settings', saved);
+      Object.assign(settings, DEFAULTS);
+      applyStyle();
+      fillForm();
+      recompute(0);
+    });
+
+    function toggle(open) {
+      panel.hidden = !open;
+      tab.classList.toggle('open', open);
+      if (open) fillForm();
+    }
+    tab.addEventListener('click', () => toggle(panel.hidden));
+    $('close').addEventListener('click', () => toggle(false));
+
+    // 只在播放页显示；全屏时挂到全屏元素里才看得见
+    function place() {
+      host.style.display = location.pathname.startsWith('/watch') ? '' : 'none';
+      const parent = document.fullscreenElement || document.documentElement;
+      if (host.parentNode !== parent) parent.appendChild(host);
+      if (!panel.hidden) refreshStatus();
+    }
+    document.addEventListener('fullscreenchange', place);
+    setInterval(place, 1000);
+    place();
+  }
+
   function start() {
     loadFreq().then(() => {
-      new MutationObserver(scan).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      let timer = null;
+      new MutationObserver(() => {
+        if (timer) return;
+        timer = setTimeout(() => { timer = null; scan(); }, 30);
+      }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
       scan();
     });
+    buildUI();
   }
   start();
 })();
