@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.6
+// @version      0.7
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方或词后括号里显示中文
 // @match        https://www.netflix.com/*
 // @updateURL    https://raw.githubusercontent.com/FFateMoney/netflix-vocab/main/netflix-vocab.user.js
@@ -337,7 +337,12 @@
   style.textContent =
     '.vv-note{color:var(--vv-color);font-weight:normal}' +
     'rt.vv-note{font-size:calc(var(--vv-size) * 1em)}' +
-    'span.vv-note{font-size:calc(var(--vv-size) * 1.25em);margin-left:.1em}';
+    'rt.vv-note:empty{display:none}' +
+    // 括号模式沿用 ruby 结构（和上方小字模式的 DOM 完全一致），只把排版改成行内，括号用伪元素加
+    'ruby.vv-paren,ruby.vv-paren>rt.vv-note{display:inline}' +
+    'ruby.vv-paren>rt.vv-note{font-size:calc(var(--vv-size) * 1.25em);margin-left:.1em}' +
+    'ruby.vv-paren>rt.vv-note::before{content:"("}' +
+    'ruby.vv-paren>rt.vv-note::after{content:")"}';
   document.documentElement.appendChild(style);
 
   function applyStyle() {
@@ -357,25 +362,47 @@
       done.add(t);
       return t;
     };
-    const paren = settings.mode === 2;
+    const paren = settings.mode === 2 && !loopBroken;
     for (const tok of tokenize(node.nodeValue, lone)) {
       if (!tok.word) { frag.appendChild(addText(tok.text)); continue; }
       changed = true;
-      const wrap = document.createElement(paren ? 'span' : 'ruby');
-      wrap.className = 'vv-wrap';
+      const wrap = document.createElement('ruby');
+      wrap.className = paren ? 'vv-wrap vv-paren' : 'vv-wrap';
       wrap.appendChild(addText(tok.text));
-      const note = document.createElement(paren ? 'span' : 'rt');
+      const note = document.createElement('rt');
       note.className = 'vv-note';
       wrap.appendChild(note);
       frag.appendChild(wrap);
-      need(tok.word).then(zh => { if (zh) note.textContent = paren ? '(' + zh + ')' : zh; });
+      need(tok.word).then(zh => { if (zh) note.textContent = zh; });
     }
-    if (changed) node.replaceWith(frag);
+    if (changed) { node.replaceWith(frag); noteAnnotation(); }
     else done.add(node);
   }
 
+  // 保险：如果 Netflix 因为我们改了字幕布局而不停重绘字幕，我们又不停重新标注，就会一直闪。
+  // 1 秒内标注次数异常多时，判定为循环：先退回上方小字（不改变行宽），仍然循环就暂停 5 秒
+  let loopBroken = false;
+  let pausedUntil = 0;
+  const passes = [];
+  function noteAnnotation() {
+    const now = Date.now();
+    passes.push(now);
+    while (passes.length && now - passes[0] > 1000) passes.shift();
+    if (passes.length <= 8) return;
+    console.warn('[netflix-vocab] 字幕被反复重绘（1 秒内标注 ' + passes.length + ' 次），' +
+      (loopBroken || settings.mode !== 2 ? '暂停 5 秒' : '括号模式暂时改用上方小字'));
+    passes.length = 0;
+    if (loopBroken || settings.mode !== 2) {
+      pausedUntil = now + 5000;
+    } else {
+      loopBroken = true;
+      toast('括号模式与 Netflix 渲染冲突，已临时改用上方小字');
+    }
+    setTimeout(rerender, 0);
+  }
+
   function scan() {
-    if (!settings.enabled || !freqLoaded) return;
+    if (!settings.enabled || !freqLoaded || Date.now() < pausedUntil) return;
     // 直接遍历字幕区域里的文本节点，不依赖 span 的层级结构（多行字幕会有换行节点）
     document.querySelectorAll('.player-timedtext').forEach(root => {
       const lone = (root.textContent.match(WORDS_G) || []).length === 1;
@@ -496,7 +523,7 @@
       change('enabled', e.target.checked);
       if (!e.target.checked) clearAnnotations();
     });
-    $('mode').addEventListener('change', e => change('mode', Number(e.target.value)));
+    $('mode').addEventListener('change', e => { loopBroken = false; change('mode', Number(e.target.value)); });
     ['topN', 'minLen', 'size'].forEach(k => $(k).addEventListener('input', e => {
       $(k + '-v').textContent = e.target.value;
       change(k, Number(e.target.value));
