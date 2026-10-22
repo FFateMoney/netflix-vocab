@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Netflix 生词注释
 // @namespace    local.netflix-vocab
-// @version      0.2
+// @version      0.3
 // @description  截获 Netflix 英文字幕文件，提前翻译生词，播放时在词上方显示中文小字
 // @match        https://www.netflix.com/*
 // @run-at       document-start
@@ -110,6 +110,7 @@
           batch.forEach(w => inflight.delete(w));
           running--;
           waiting.forEach(fn => fn());
+          if (!queue.length && running === 0 && total > 0) reportDone();
           setTimeout(pump, 150);
         });
     }
@@ -128,13 +129,31 @@
     });
   }
 
+  let total = 0;      // 本轮预加载需要翻译的词数
   function enqueue(words) {
     for (const w of words) {
       if (cache.has(w) || inflight.has(w)) continue;
       inflight.add(w);
       queue.push(w);
+      total++;
     }
     pump();
+  }
+
+  function toast(msg) {
+    const el = document.createElement('div');
+    el.textContent = msg;
+    el.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483647;padding:8px 12px;' +
+      'border-radius:6px;background:rgba(0,0,0,.75);color:#ffd54a;font:14px sans-serif;' +
+      'pointer-events:none;transition:opacity .5s;';
+    (document.fullscreenElement || document.documentElement).appendChild(el);
+    setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 600); }, 4000);
+  }
+
+  function reportDone() {
+    console.log('[netflix-vocab] 翻译完成，共 ' + total + ' 个生词');
+    toast('生词翻译完成（' + total + ' 个）');
+    total = 0;
   }
 
   // ---------- 截获字幕文件并预翻译 ----------
